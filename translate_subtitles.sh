@@ -3,18 +3,17 @@
 # Subtitle Translation Script for ZenDRIVE
 # Translates all .en.srt files to specified languages (default: French, Dutch, German, Arabic, Japanese, Danish)
 #
+# Uses AWS Translate REST API (no AWS CLI required)
+# Requires: curl, openssl, od (octal dump)
+#
 # Usage:
-#   ./translate_subtitles.sh [directory]              # Use Claude (sequential) in specified directory
-#   ./translate_subtitles.sh                          # Use Claude (sequential) in current directory
-#   TRANSLATE_SERVICE=aws ./translate_subtitles.sh [directory]  # Use AWS Translate (concurrent)
+#   ./translate_subtitles.sh [directory]              # Translate in specified directory
+#   ./translate_subtitles.sh                          # Translate in current directory
 #   DEBUG=1 ./translate_subtitles.sh [directory]      # Enable debug mode
 #   TRANSLATE_LANGUAGES="es,fr,de" ./translate_subtitles.sh    # Translate to specific languages
 
 # Debug mode (set to 1 to enable debug output)
 DEBUG=${DEBUG:-0}
-
-# Translation service (claude or aws)
-TRANSLATE_SERVICE=${TRANSLATE_SERVICE:-claude}
 
 # Languages to translate to (default: fr,nl,de,ar,ja,da)
 # Format: comma-separated list of language codes
@@ -133,32 +132,185 @@ parse_srt_file() {
     debug "Parsed $line_count lines into ${#subtitle_blocks_ref[@]} subtitle blocks"
 }
 
-# Function to translate text using AWS Translate
+# Function to get AWS credentials
+get_aws_credentials() {
+    local aws_access_key=""
+    local aws_secret_key=""
+    local aws_session_token=""
+
+    # Try environment variables first
+    if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+        aws_access_key="$AWS_ACCESS_KEY_ID"
+        aws_secret_key="$AWS_SECRET_ACCESS_KEY"
+        aws_session_token="${AWS_SESSION_TOKEN:-}"
+        debug "Using AWS credentials from environment variables"
+    # Try credentials file
+    elif [ -f "$HOME/.aws/credentials" ]; then
+        local profile="${AWS_PROFILE:-default}"
+        aws_access_key=$(grep -A2 "\[$profile\]" "$HOME/.aws/credentials" | grep "aws_access_key_id" | cut -d'=' -f2 | xargs)
+        aws_secret_key=$(grep -A2 "\[$profile\]" "$HOME/.aws/credentials" | grep "aws_secret_access_key" | cut -d'=' -f2 | xargs)
+        aws_session_token=$(grep -A3 "\[$profile\]" "$HOME/.aws/credentials" | grep "aws_session_token" | cut -d'=' -f2 | xargs)
+        debug "Using AWS credentials from credentials file (profile: $profile)"
+    fi
+
+    if [ -z "$aws_access_key" ] || [ -z "$aws_secret_key" ]; then
+        debug "Failed to retrieve AWS credentials"
+        return 1
+    fi
+
+    # Return credentials as pipe-separated string
+    echo "$aws_access_key|$aws_secret_key|$aws_session_token"
+    return 0
+}
+
+# Function to create AWS Signature Version 4
+# Based on: https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
+sign_aws_request() {
+    local method="$1"
+    local service="$2"
+    local region="$3"
+    local host="$4"
+    local endpoint="$5"
+    local payload="$6"
+    local access_key="$7"
+    local secret_key="$8"
+    local session_token="$9"
+
+    # Get current timestamp
+    local amz_date=$(date -u +"%Y%m%dT%H%M%SZ")
+    local date_stamp=$(date -u +"%Y%m%d")
+
+    # Create canonical request
+    local canonical_uri="$endpoint"
+    local canonical_querystring=""
+    local canonical_headers="content-type:application/x-amz-json-1.1
+host:$host
+x-amz-date:$amz_date"
+
+    if [ -n "$session_token" ]; then
+        canonical_headers="$canonical_headers
+x-amz-security-token:$session_token"
+    fi
+
+    local signed_headers="content-type;host;x-amz-date"
+    if [ -n "$session_token" ]; then
+        signed_headers="$signed_headers;x-amz-security-token"
+    fi
+
+    local payload_hash=$(echo -n "$payload" | openssl dgst -sha256 -hex | sed 's/^.* //')
+
+    local canonical_request="$method
+$canonical_uri
+$canonical_querystring
+$canonical_headers
+
+$signed_headers
+$payload_hash"
+
+    # Create string to sign
+    local algorithm="AWS4-HMAC-SHA256"
+    local credential_scope="$date_stamp/$region/$service/aws4_request"
+    local canonical_request_hash=$(echo -n "$canonical_request" | openssl dgst -sha256 -hex | sed 's/^.* //')
+
+    local string_to_sign="$algorithm
+$amz_date
+$credential_scope
+$canonical_request_hash"
+
+    # Calculate signature
+    # Use od instead of xxd/hexdump for better portability
+    local k_secret="AWS4$secret_key"
+    local k_date=$(echo -n "$date_stamp" | openssl dgst -sha256 -hmac "$k_secret" -binary)
+    local k_region=$(echo -n "$region" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$(echo -n "$k_date" | od -A n -t x1 | tr -d ' \n')" -binary)
+    local k_service=$(echo -n "$service" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$(echo -n "$k_region" | od -A n -t x1 | tr -d ' \n')" -binary)
+    local k_signing=$(echo -n "aws4_request" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$(echo -n "$k_service" | od -A n -t x1 | tr -d ' \n')" -binary)
+    local signature=$(echo -n "$string_to_sign" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$(echo -n "$k_signing" | od -A n -t x1 | tr -d ' \n')" -hex | sed 's/^.* //')
+
+    # Create authorization header
+    local authorization_header="$algorithm Credential=$access_key/$credential_scope, SignedHeaders=$signed_headers, Signature=$signature"
+
+    # Return headers as pipe-separated values
+    echo "$authorization_header|$amz_date|$session_token"
+    return 0
+}
+
+# Function to translate text using AWS Translate REST API
 translate_text_aws() {
     local text="$1"
     local target_lang="$2"
-    
-    debug "Translating ${#text} characters to $target_lang"
-    
-    # Use AWS Translate directly with text parameter
-    local aws_output
-    local aws_exit_code
-    
-    aws_output=$(aws translate translate-text \
-        --source-language-code en \
-        --target-language-code "$target_lang" \
-        --text "$text" \
-        --region us-east-1 \
-        --output text \
-        --query 'TranslatedText' 2>&1)
-    aws_exit_code=$?
-    
-    if [ $aws_exit_code -eq 0 ]; then
-        # Remove quotes from AWS output and handle escaped characters
-        echo "$aws_output" | sed 's/^"//;s/"$//' | sed 's/\\n/\n/g'
-        return 0
+    local region="us-east-1"
+
+    debug "Translating ${#text} characters to $target_lang using REST API"
+
+    # Get AWS credentials
+    local creds
+    if ! creds=$(get_aws_credentials); then
+        debug "Failed to get AWS credentials"
+        return 1
+    fi
+
+    IFS='|' read -r access_key secret_key session_token <<< "$creds"
+
+    # Prepare request
+    local service="translate"
+    local host="translate.$region.amazonaws.com"
+    local endpoint="/"
+    local method="POST"
+
+    # Create JSON payload - escape special characters in text
+    local escaped_text=$(echo -n "$text" | sed 's/\\/\\\\/g' | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+    local payload="{\"Text\":\"$escaped_text\",\"SourceLanguageCode\":\"en\",\"TargetLanguageCode\":\"$target_lang\"}"
+
+    # Sign the request
+    local sign_result
+    if ! sign_result=$(sign_aws_request "$method" "$service" "$region" "$host" "$endpoint" "$payload" "$access_key" "$secret_key" "$session_token"); then
+        debug "Failed to sign AWS request"
+        return 1
+    fi
+
+    IFS='|' read -r authorization amz_date returned_token <<< "$sign_result"
+
+    # Make the request using curl
+    local response
+    local http_code
+
+    if [ -n "$session_token" ]; then
+        response=$(curl -s -w "\n%{http_code}" -X POST "https://$host$endpoint" \
+            -H "Content-Type: application/x-amz-json-1.1" \
+            -H "X-Amz-Target: AWSShineFrontendService_20170701.TranslateText" \
+            -H "X-Amz-Date: $amz_date" \
+            -H "X-Amz-Security-Token: $session_token" \
+            -H "Authorization: $authorization" \
+            -d "$payload" 2>&1)
     else
-        debug "AWS Translate failed: $aws_output"
+        response=$(curl -s -w "\n%{http_code}" -X POST "https://$host$endpoint" \
+            -H "Content-Type: application/x-amz-json-1.1" \
+            -H "X-Amz-Target: AWSShineFrontendService_20170701.TranslateText" \
+            -H "X-Amz-Date: $amz_date" \
+            -H "Authorization: $authorization" \
+            -d "$payload" 2>&1)
+    fi
+
+    # Extract HTTP code and body
+    http_code=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+
+    debug "HTTP response code: $http_code"
+
+    if [ "$http_code" = "200" ]; then
+        # Extract TranslatedText from JSON response
+        # Using grep and sed to avoid dependency on jq
+        local translated_text=$(echo "$body" | grep -o '"TranslatedText":"[^"]*"' | sed 's/"TranslatedText":"//;s/"$//' | sed 's/\\n/\n/g' | sed 's/\\"/"/g')
+
+        if [ -n "$translated_text" ]; then
+            echo "$translated_text"
+            return 0
+        else
+            debug "Failed to extract TranslatedText from response: $body"
+            return 1
+        fi
+    else
+        debug "AWS Translate API request failed with HTTP $http_code: $body"
         return 1
     fi
 }
@@ -356,82 +508,6 @@ translate_file_content_aws() {
     return 0
 }
 
-# Function to translate subtitle blocks in chunks (Claude)
-translate_subtitle_chunks() {
-    local source_file="$1"
-    local target_file="$2"
-    local lang_name="$3"
-    local -n blocks_ref=$4
-    
-    local chunk_size=10  # Process 10 subtitle blocks at a time
-    local total_blocks=${#blocks_ref[@]}
-    local processed=0
-    
-    debug "Translating $total_blocks subtitle blocks in chunks of $chunk_size"
-    
-    # Clear target file
-    > "$target_file"
-    
-    for ((i=0; i<total_blocks; i+=chunk_size)); do
-        local chunk_end=$((i + chunk_size - 1))
-        if [ $chunk_end -ge $total_blocks ]; then
-            chunk_end=$((total_blocks - 1))
-        fi
-        
-        debug "Processing chunk $((i / chunk_size + 1)): blocks $((i + 1))-$((chunk_end + 1))"
-        
-        # Build chunk content
-        local chunk_content=""
-        for ((j=i; j<=chunk_end; j++)); do
-            if [ $j -lt $total_blocks ]; then
-                if [ -n "$chunk_content" ]; then
-                    chunk_content="$chunk_content"$'\n\n'"${blocks_ref[$j]}"
-                else
-                    chunk_content="${blocks_ref[$j]}"
-                fi
-            fi
-        done
-        
-        # Create translation prompt for this chunk
-        local prompt="Translate these SRT subtitle entries from English to $lang_name. 
-
-IMPORTANT: Only output the translated SRT content - no explanations or additional text.
-
-Keep the exact same format:
-- Same subtitle numbers
-- Same timecodes (HH:MM:SS,mmm --> HH:MM:SS,mmm)
-- Only translate the subtitle text
-- Keep blank lines between entries
-
-Input subtitles:
-$chunk_content"
-
-        debug "Chunk prompt length: ${#prompt} characters"
-        
-        # Call Claude for this chunk
-        local claude_output
-        local claude_exit_code
-        
-        claude_output=$(claude --model claude-sonnet-4-20250514 -p "$prompt" 2>&1)
-        claude_exit_code=$?
-        
-        if [ $claude_exit_code -eq 0 ]; then
-            # Append translated chunk to target file
-            echo "$claude_output" >> "$target_file"
-            echo >> "$target_file"  # Add blank line between chunks
-            processed=$((chunk_end + 1))
-            debug "Successfully translated chunk $((i / chunk_size + 1)), processed $processed/$total_blocks blocks"
-        else
-            debug "Claude failed for chunk $((i / chunk_size + 1)): $claude_output"
-            echo -e "${RED}ERROR${NC} Translation failed for chunk $((i / chunk_size + 1))"
-            return 1
-        fi
-        
-    done
-    
-    debug "All chunks processed successfully"
-    return 0
-}
 
 # Function to process single translation job (used for concurrent processing)
 process_translation_job() {
@@ -489,130 +565,19 @@ process_translation_job() {
     fi
 }
 
-# Function to translate a file (legacy function for Claude compatibility)
-translate_file() {
-    local source_file="$1"
-    local lang_code="$2"
-    local lang_name="$3"
-    
-    debug "Starting translation: $source_file -> $lang_code ($lang_name)"
-    
-    # Generate target filename by replacing .en.srt with .$lang_code.srt
-    local target_file="${source_file%.en.srt}.$lang_code.srt"
-    debug "Target file: $target_file"
-    
-    # Ensure target directory exists
-    local target_dir=$(dirname "$target_file")
-    if [ ! -d "$target_dir" ]; then
-        debug "Creating target directory: $target_dir"
-        mkdir -p "$target_dir"
-    fi
-    
-    # Check if target file already exists
-    if [ -f "$target_file" ]; then
-        debug "Target file already exists, skipping"
-        echo -e "${YELLOW}SKIP${NC} $target_file (already exists)"
-        return 0
-    fi
-    
-    # Check if source file exists
-    if [ ! -f "$source_file" ]; then
-        debug "Source file not found: $source_file"
-        echo -e "${RED}ERROR${NC} Source file does not exist: $source_file"
-        return 1
-    fi
-    
-    # Get source file size for debugging
-    local file_size=$(stat -c%s "$source_file" 2>/dev/null || echo "unknown")
-    debug "Source file size: $file_size bytes"
-    
-    log "Translating $(basename "$source_file") to $lang_name..."
-    
-    # Parse SRT file into subtitle blocks
-    local subtitle_blocks=()
-    parse_srt_file "$source_file" subtitle_blocks
-    
-    if [ ${#subtitle_blocks[@]} -eq 0 ]; then
-        debug "No subtitle blocks found in source file"
-        echo -e "${RED}ERROR${NC} No subtitle blocks found in $source_file"
-        return 1
-    fi
-    
-    # Translate using selected service
-    local translation_start_time=$(date +%s)
-    local translation_success=false
-    
-    if [ "$TRANSLATE_SERVICE" = "aws" ]; then
-        debug "Using AWS Translate service"
-        if translate_subtitle_chunks_aws "$source_file" "$target_file" "$lang_code" subtitle_blocks; then
-            translation_success=true
-        fi
-    else
-        debug "Using Claude translation service"
-        if translate_subtitle_chunks "$source_file" "$target_file" "$lang_name" subtitle_blocks; then
-            translation_success=true
-        fi
-    fi
-    
-    local translation_end_time=$(date +%s)
-    local translation_duration=$((translation_end_time - translation_start_time))
-    debug "Translation execution time: ${translation_duration}s"
-    
-    if [ "$translation_success" = true ]; then
-        
-        # Check if the target file was created and has content
-        if [ -f "$target_file" ] && [ -s "$target_file" ]; then
-            local target_size=$(stat -c%s "$target_file" 2>/dev/null || echo "unknown")
-            debug "Target file created, size: $target_size bytes"
-            
-            # Validate line counts match between source and target files
-            local source_lines=$(wc -l < "$source_file")
-            local target_lines=$(wc -l < "$target_file")
-            debug "Source file lines: $source_lines, Target file lines: $target_lines"
-            
-            if [ "$source_lines" -eq "$target_lines" ]; then
-                debug "Line count validation passed"
-                
-                # Change ownership if FILE_OWNER is set
-                if [ -n "$FILE_OWNER" ] && [ "$FILE_OWNER" != "none" ]; then
-                    if chown "$FILE_OWNER" "$target_file" 2>/dev/null; then
-                        debug "Changed ownership of $target_file to $FILE_OWNER"
-                    else
-                        debug "Failed to change ownership of $target_file (may need root privileges)"
-                    fi
-                fi
-                
-                echo -e "${GREEN}SUCCESS${NC} Created $target_file (${target_lines} lines)"
-                return 0
-            else
-                debug "Line count validation failed: source has $source_lines lines, target has $target_lines lines"
-                echo -e "${RED}ERROR${NC} Translation incomplete - line count mismatch: source ($source_lines) vs target ($target_lines)"
-                return 1
-            fi
-        else
-            debug "Target file missing or empty after translation"
-            echo -e "${RED}ERROR${NC} Translation failed - file not created or empty: $target_file"
-            return 1
-        fi
-    else
-        echo -e "${RED}ERROR${NC} Translation failed for $source_file -> $lang_name"
-        return 1
-    fi
-}
 
 # Main script for AWS concurrent processing
 main_aws_concurrent() {
     local target_dir="${1:-.}"  # Use provided directory or current directory
-    
+
     # Validate directory
     if [ ! -d "$target_dir" ]; then
         echo -e "${RED}ERROR${NC} Directory '$target_dir' does not exist"
         exit 1
     fi
-    
-    log "Starting ZenDRIVE subtitle translation script (AWS Concurrent Mode)"
+
+    log "Starting ZenDRIVE subtitle translation script (AWS Translate REST API)"
     debug "Debug mode: $DEBUG"
-    debug "Translation service: $TRANSLATE_SERVICE"
     debug "Target directory: $(realpath "$target_dir")"
     debug "Working directory: $(pwd)"
     log "Target directory: $(realpath "$target_dir")"
@@ -770,125 +735,28 @@ main_aws_concurrent() {
     fi
 }
 
-# Main script for Claude sequential processing
-main_claude_sequential() {
-    local target_dir="${1:-.}"  # Use provided directory or current directory
-    
-    # Validate directory
-    if [ ! -d "$target_dir" ]; then
-        echo -e "${RED}ERROR${NC} Directory '$target_dir' does not exist"
-        exit 1
-    fi
-    
-    log "Starting ZenDRIVE subtitle translation script (Claude Sequential Mode)"
-    debug "Debug mode: $DEBUG"
-    debug "Translation service: $TRANSLATE_SERVICE"
-    debug "Target directory: $(realpath "$target_dir")"
-    debug "Working directory: $(pwd)"
-    debug "Script arguments: $*"
-    log "Translation service: $TRANSLATE_SERVICE"
-    log "Target directory: $(realpath "$target_dir")"
-    
-    # Build language list for display
-    local lang_list=""
-    for lang_code in "${!LANGUAGES[@]}"; do
-        if [ -n "$lang_list" ]; then
-            lang_list="$lang_list, ${LANGUAGES[$lang_code]} ($lang_code)"
-        else
-            lang_list="${LANGUAGES[$lang_code]} ($lang_code)"
-        fi
-    done
-    log "Languages: $lang_list"
-    
-    # Find all .en.srt files in the target directory
-    debug "Searching for *.en.srt files in $target_dir..."
-    mapfile -t en_files < <(find "$target_dir" -name "*.en.srt" | sort)
-    debug "Find command completed, found ${#en_files[@]} files"
-    
-    if [ ${#en_files[@]} -eq 0 ]; then
-        debug "No .en.srt files found"
-        echo -e "${RED}ERROR${NC} No .en.srt files found in $target_dir and subdirectories"
-        exit 1
-    fi
-    
-    log "Found ${#en_files[@]} English subtitle files to translate"
-    if [ "$DEBUG" -eq 1 ]; then
-        debug "Files found:"
-        for file in "${en_files[@]}"; do
-            debug "  - $file"
-        done
-    fi
-    
-    # Count totals for progress tracking
-    local total_files=$((${#en_files[@]} * ${#LANGUAGES[@]}))
-    local completed=0
-    local errors=0
-    debug "Total translation jobs: $total_files (${#en_files[@]} files × ${#LANGUAGES[@]} languages)"
-    
-    local start_time=$(date +%s)
-    
-    # Process each file for each language
-    for source_file in "${en_files[@]}"; do
-        echo
-        log "Processing: $(basename "$source_file")"
-        debug "Full source path: $source_file"
-        
-        for lang_code in "${!LANGUAGES[@]}"; do
-            lang_name="${LANGUAGES[$lang_code]}"
-            debug "Processing language: $lang_code ($lang_name)"
-            
-            local file_start_time=$(date +%s)
-            if translate_file "$source_file" "$lang_code" "$lang_name"; then
-                ((completed++))
-                debug "Translation successful"
-            else
-                ((errors++))
-                debug "Translation failed"
-            fi
-            local file_end_time=$(date +%s)
-            local file_duration=$((file_end_time - file_start_time))
-            debug "File processing time: ${file_duration}s"
-            
-            # Progress indicator
-            local progress=$(( (completed + errors) * 100 / total_files ))
-            echo -e "${BLUE}Progress:${NC} $progress% ($((completed + errors))/$total_files) - ${GREEN}$completed success${NC}, ${RED}$errors errors${NC}"
-        done
-    done
-    
-    local end_time=$(date +%s)
-    local total_duration=$((end_time - start_time))
-    debug "Total script execution time: ${total_duration}s"
-    
-    echo
-    log "Translation complete!"
-    log "Total files processed: $((completed + errors))/$total_files"
-    log "Successful translations: $completed"
-    log "Errors: $errors"
-    
-    if [ $errors -eq 0 ]; then
-        echo -e "${GREEN}All translations completed successfully!${NC}"
-        exit 0
-    else
-        echo -e "${YELLOW}Completed with $errors errors. Check the output above for details.${NC}"
-        exit 1
-    fi
-}
 
 # Show usage information
 show_usage() {
     echo "Usage: $0 [directory]"
     echo
-    echo "Translates all .en.srt files to specified languages"
+    echo "Translates all .en.srt files to specified languages using AWS Translate REST API"
     echo "Default languages: French (fr), Dutch (nl), German (de), Arabic (ar), Japanese (ja), Danish (da)"
     echo
     echo "Arguments:"
     echo "  directory    Directory to search for .en.srt files (default: current directory)"
     echo
     echo "Environment Variables:"
-    echo "  TRANSLATE_SERVICE    Translation service to use: 'aws' or 'claude' (default: claude)"
     echo "  TRANSLATE_LANGUAGES  Comma-separated list of language codes (default: fr,nl,de,ar,ja,da)"
     echo "  FILE_OWNER          Ownership for created files as user:group (default: 32574:32574)"
     echo "  DEBUG               Enable debug output: 1 or 0 (default: 0)"
+    echo
+    echo "Requirements:"
+    echo "  - curl, openssl, od (no AWS CLI required)"
+    echo "  - AWS credentials via environment variables or ~/.aws/credentials:"
+    echo "    * AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+    echo "    * Optional: AWS_SESSION_TOKEN for temporary credentials"
+    echo "    * Optional: AWS_PROFILE to select credential profile (default: default)"
     echo
     echo "Supported Language Codes:"
     echo "  fr=French, nl=Dutch, de=German, ar=Arabic, ja=Japanese, da=Danish"
@@ -896,14 +764,16 @@ show_usage() {
     echo "  hi=Hindi, tr=Turkish, pl=Polish, sv=Swedish, no=Norwegian, fi=Finnish"
     echo
     echo "Examples:"
-    echo "  $0                                    # Translate files in current directory using Claude"
-    echo "  $0 /path/to/videos                   # Translate files in specified directory using Claude"
-    echo "  TRANSLATE_SERVICE=aws $0             # Use AWS Translate (concurrent processing)"
+    echo "  $0                                    # Translate files in current directory"
+    echo "  $0 /path/to/videos                   # Translate files in specified directory"
     echo "  TRANSLATE_LANGUAGES=\"es,fr,de\" $0    # Translate only to Spanish, French, and German"
     echo "  TRANSLATE_LANGUAGES=\"es\" $0          # Translate only to Spanish"
     echo "  FILE_OWNER=\"1000:1000\" $0            # Set different ownership"
     echo "  FILE_OWNER=\"none\" $0                 # Don't change ownership"
     echo "  DEBUG=1 $0 /path/to/videos           # Enable debug mode"
+    echo
+    echo "  # Using AWS environment variables:"
+    echo "  AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... $0"
 }
 
 # Main script dispatcher
@@ -913,7 +783,7 @@ main() {
         show_usage
         exit 0
     fi
-    
+
     # Check for too many arguments
     if [ $# -gt 1 ]; then
         echo -e "${RED}ERROR${NC} Too many arguments provided"
@@ -921,54 +791,57 @@ main() {
         show_usage
         exit 1
     fi
-    
-    if [ "$TRANSLATE_SERVICE" = "aws" ]; then
-        main_aws_concurrent "$@"
-    else
-        main_claude_sequential "$@"
-    fi
+
+    main_aws_concurrent "$@"
 }
 
-# Check if required translation service is available
-if [ "$TRANSLATE_SERVICE" = "aws" ]; then
-    debug "Checking for AWS CLI availability..."
-    if ! command -v aws &> /dev/null; then
-        debug "AWS CLI not found in PATH"
-        echo -e "${RED}ERROR${NC} 'aws' command not found. Please ensure AWS CLI is installed and configured."
-        exit 1
-    fi
-    debug "AWS CLI found: $(which aws)"
-    
-    # Test AWS credentials
-    debug "Testing AWS credentials..."
-    if ! aws sts get-caller-identity &> /dev/null; then
-        debug "AWS credentials not configured"
-        echo -e "${RED}ERROR${NC} AWS credentials not configured. Run 'aws configure' first."
-        exit 1
-    fi
-    debug "AWS credentials configured"
-else
-    debug "Checking for Claude CLI availability..."
-    if ! command -v claude &> /dev/null; then
-        debug "Claude CLI not found in PATH"
-        echo -e "${RED}ERROR${NC} 'claude' command not found. Please ensure Claude CLI is installed and in PATH."
-        exit 1
-    fi
-    debug "Claude CLI found: $(which claude)"
-fi
+# Check if required tools are available
+debug "Checking for required tools (curl, openssl, od)..."
 
-# Show usage information
-if [ "$DEBUG" -eq 1 ]; then
-    debug "=== DEBUG MODE ENABLED ==="
-    debug "To disable debug mode, run: DEBUG=0 $0"
-    debug "To enable debug mode, run: DEBUG=1 $0"
-    debug "=========================="
-    debug "=== TRANSLATION SERVICE ==="
-    debug "Current service: $TRANSLATE_SERVICE"
-    debug "To use AWS Translate: TRANSLATE_SERVICE=aws $0"
-    debug "To use Claude: TRANSLATE_SERVICE=claude $0"
-    debug "=========================="
+# Check for curl
+if ! command -v curl &> /dev/null; then
+    debug "curl not found in PATH"
+    echo -e "${RED}ERROR${NC} 'curl' command not found. Please install curl to use AWS Translate API."
+    exit 1
 fi
+debug "curl found: $(which curl)"
+
+# Check for openssl
+if ! command -v openssl &> /dev/null; then
+    debug "openssl not found in PATH"
+    echo -e "${RED}ERROR${NC} 'openssl' command not found. Please install openssl to use AWS Translate API."
+    exit 1
+fi
+debug "openssl found: $(which openssl)"
+
+# Check for od
+if ! command -v od &> /dev/null; then
+    debug "od not found in PATH"
+    echo -e "${RED}ERROR${NC} 'od' command not found. Please install od (usually part of coreutils package) to use AWS Translate API."
+    exit 1
+fi
+debug "od found: $(which od)"
+
+# Test AWS credentials availability
+debug "Testing AWS credentials availability..."
+test_creds=""
+if ! test_creds=$(get_aws_credentials); then
+    debug "AWS credentials not configured"
+    echo -e "${RED}ERROR${NC} AWS credentials not configured."
+    echo -e "Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables,"
+    echo -e "or configure credentials in ~/.aws/credentials file."
+    echo -e ""
+    echo -e "Example:"
+    echo -e "  export AWS_ACCESS_KEY_ID=your_access_key"
+    echo -e "  export AWS_SECRET_ACCESS_KEY=your_secret_key"
+    echo -e ""
+    echo -e "Or create ~/.aws/credentials with:"
+    echo -e "  [default]"
+    echo -e "  aws_access_key_id = your_access_key"
+    echo -e "  aws_secret_access_key = your_secret_key"
+    exit 1
+fi
+debug "AWS credentials configured"
 
 # Run main function
 main "$@"
